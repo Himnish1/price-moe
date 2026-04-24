@@ -1910,6 +1910,18 @@ def _add_inference_args(parser):
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
+    if '--wandb-project' not in parser._option_string_actions:
+        group.add_argument('--wandb-project', type=str, default='',
+                       help='WandB project name. If empty, WandB logging is disabled.')
+    if '--wandb-exp-name' not in parser._option_string_actions:
+        group.add_argument('--wandb-exp-name', type=str, default='',
+                       help='WandB experiment/run name.')
+    if '--wandb-save-dir' not in parser._option_string_actions:
+        group.add_argument('--wandb-save-dir', type=str, default=None,
+                       help='Local directory to save WandB results.')
+    if '--wandb-entity' not in parser._option_string_actions:
+        group.add_argument('--wandb-entity', type=str, default=None,
+                       help='WandB entity (team or username).')
     group.add_argument('--inference-text-gen-server-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False,
                        help='Enable per-request logging in the inference text generation server.')
@@ -3086,8 +3098,9 @@ def _add_vision_args(parser):
 def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
     # General arguments
-    group.add_argument('--num-experts', type=int, default=None,
-                       help='Number of Experts in MoE (None means no MoE)')
+    if '--num-experts' not in parser._option_string_actions:
+        group.add_argument('--num-experts', type=int, default=None,
+                           help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-layer-freq', type=moe_freq_type, default=1,
                        help='Frequency between MoE layers and Dense layers. Accepts either: '
                             '- An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers '
@@ -3106,23 +3119,31 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
-    group.add_argument('--moe-capacity-priced-routing', action='store_true', default=False,
-                       help='Enable capacity-priced routing for MoE (top-1 only).')
-    group.add_argument('--moe-cp-price-learning-rate', type=float, default=0.01,
-                       help='Tatonnement step size for updating expert prices.')
-    group.add_argument('--moe-cp-slack-capacity', type=float, default=0.9,
-                       help='Target expert utilization factor in [0, 1].')
-    group.add_argument('--moe-cp-expert-capacity', type=int, default=None,
-                       help='Per-expert target capacity. If None, uses tokens_per_batch/num_experts.')
-    group.add_argument('--moe-cp-price-update-frequency', type=int, default=1,
-                       help='Update expert prices every N routing steps.')
-    group.add_argument('--moe-cp-routing-offset', action='store_true', default=True,
-                       help='Apply expert price offset at dispatch time (Ablation D).')
-    group.add_argument('--no-moe-cp-routing-offset', action='store_false',
-                       dest='moe_cp_routing_offset',
-                       help='Disable routing offset and dispatch with raw logits (Ablation C).')
-    group.add_argument('--moe-cp-log-interval', type=int, default=100,
-                       help='Logging interval for CP-MoE diagnostics.')
+    if '--moe-capacity-priced-routing' not in parser._option_string_actions:
+        group.add_argument('--moe-capacity-priced-routing', action='store_true', default=False,
+                           help='Enable capacity-priced routing for MoE (top-1 only).')
+    if '--moe-cp-price-learning-rate' not in parser._option_string_actions:
+        group.add_argument('--moe-cp-price-learning-rate', type=float, default=0.01,
+                           help='Tatonnement step size for updating expert prices.')
+    if '--moe-cp-slack-capacity' not in parser._option_string_actions:
+        group.add_argument('--moe-cp-slack-capacity', type=float, default=0.9,
+                           help='Target expert utilization factor in [0, 1].')
+    if '--moe-cp-expert-capacity' not in parser._option_string_actions:
+        group.add_argument('--moe-cp-expert-capacity', type=int, default=None,
+                           help='Per-expert target capacity. If None, uses tokens_per_batch/num_experts.')
+    if '--moe-cp-price-update-frequency' not in parser._option_string_actions:
+        group.add_argument('--moe-cp-price-update-frequency', type=int, default=1,
+                           help='Update expert prices every N routing steps.')
+    if '--moe-cp-routing-offset' not in parser._option_string_actions:
+        group.add_argument('--moe-cp-routing-offset', action='store_true', default=True,
+                           help='Apply expert price offset at dispatch time (Ablation D).')
+    if '--no-moe-cp-routing-offset' not in parser._option_string_actions:
+        group.add_argument('--no-moe-cp-routing-offset', action='store_false',
+                           dest='moe_cp_routing_offset',
+                           help='Disable routing offset and dispatch with raw logits (Ablation C).')
+    if '--moe-cp-log-interval' not in parser._option_string_actions:
+        group.add_argument('--moe-cp-log-interval', type=int, default=100,
+                           help='Logging interval for CP-MoE diagnostics.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 
@@ -3130,6 +3151,7 @@ def _add_moe_args(parser):
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
     return parser
+
 
 def _add_mla_args(parser):
     group = parser.add_argument_group(title="mla")
@@ -3143,8 +3165,6 @@ def _add_mla_args(parser):
                        help="Dimension of the position embedding in the QK projection.")
     group.add_argument('--v-head-dim', type=int, default=128,
                        help="Dimension of the head in the V projection.")
-    group.add_argument('--rotary-scaling-factor', type=float, default=1.0,
-                       help="Rotary scaling factor for the rotary embeddings.")
     group.add_argument('--mscale', type=float, default=1.0,
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
@@ -3161,6 +3181,7 @@ def _add_mla_args(parser):
 
     return parser
 
+
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
     # Linear attention
@@ -3175,6 +3196,7 @@ def _add_experimental_attention_variant_args(parser):
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
     return parser
 
+
 def _add_heterogeneous_args(parser):
     """
     Heterogeneous models refer to transformer architectures where individual layers can differ
@@ -3185,33 +3207,6 @@ def _add_heterogeneous_args(parser):
     For example, https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json
 
     Most notably, the "block_config" maps to a list of attention and mlp configurations for each layer.
-    For example, the "block_config" for a 2 layer model is:
-     "block_configs": [
-        {
-            "attention": {
-                "n_heads_in_group": 8,
-                "no_op": false,
-                "replace_with_linear": false,
-            },
-            "ffn": {
-                "ffn_mult": 2.625,
-                "no_op": false,
-                "replace_with_linear": false,
-            }
-        },
-        {
-            "attention": {
-                "n_heads_in_group": null,
-                "no_op": true,
-                "replace_with_linear": false,
-            },
-            "ffn": {
-                "ffn_mult": 2.625,
-                "no_op": false,
-                "replace_with_linear": false,
-            }
-        }
-    ]
     """
     group = parser.add_argument_group(title="heterogeneous architecture")
     group.add_argument('--heterogeneous-layers-config-path', type=str, default=None,
@@ -3224,6 +3219,7 @@ def _add_heterogeneous_args(parser):
                        'Use the format of the HuggingFace config files in llama nemotron '
                        'models, e.g. https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json.')
     return parser
+
 
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
@@ -3248,7 +3244,7 @@ def _add_experimental_args(parser):
                        help='Deprecated. Use --hybrid-layer-pattern instead. '
                        'If specified, its value will be forwarded to --hybrid-layer-pattern.')
     group.add_argument('--yaml-cfg', type=str, default=None,
-                       help = 'Config file to add additional arguments')
+                       help='Config file to add additional arguments')
 
     # Args of precision-aware optimizer.
     group.add_argument('--use-precision-aware-optimizer', action='store_true',
@@ -3279,12 +3275,12 @@ def _add_experimental_args(parser):
                        help="Data type for the main gradient buffer utilized for distributed optimization "
                             "with Megatron-FSDP. If 'auto', then the native model gradient data-type will "
                             "be used for the main gradient / accumulation data-type.")
-    group.add_argument("--megatron-fsdp-grad-comm-dtype", default='auto', choices=['fp32', 'fp16', 'bf16', 'auto'],
-                        help="When using Megatron-FSDP, this controls the data-type used when communicating "
-                             "model gradients during FSDP. If 'auto', then the main gradient data-type will "
-                             "be used for the gradient communication / reduction data-type. When using NCCL "
-                             "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
-    
+    group.add_argument('--megatron-fsdp-grad-comm-dtype', default='auto', choices=['fp32', 'fp16', 'bf16', 'auto'],
+                       help="When using Megatron-FSDP, this controls the data-type used when communicating "
+                            "model gradients during FSDP. If 'auto', then the main gradient data-type will "
+                            "be used for the gradient communication / reduction data-type. When using NCCL "
+                            "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
+
     return parser
 
 
@@ -3294,6 +3290,7 @@ def _add_msc_args(parser):
                        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
     return parser
 
+
 def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     """Add quant-specific arguments to the main parser
 
@@ -3301,7 +3298,6 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     """
     try:
         from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
-
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
 
@@ -3323,6 +3319,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
             "The argument has no effect on attention layers.",
         )
     return parser
+
 
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
