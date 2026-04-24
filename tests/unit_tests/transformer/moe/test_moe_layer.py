@@ -465,6 +465,20 @@ class TestMoELayerRoutingStatsLogging:
         wandb_log.assert_not_called()
 
     @pytest.mark.internal
+    def test_log_routing_stats_skips_when_step_is_unavailable(self, monkeypatch):
+        layer = self._DummyLayer()
+        layer.layer_number = 1
+        layer.router = SimpleNamespace()
+
+        wandb_log = Mock()
+        fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        routing_map = torch.tensor([[1, 0], [0, 1]], dtype=torch.int64)
+        MoELayer._log_routing_stats(layer, routing_map)
+
+        wandb_log.assert_not_called()
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_cp_router_forward_captures_step_for_moe_routing_logging(self, monkeypatch):
         Utils.initialize_model_parallel(1, 1)
