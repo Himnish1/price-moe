@@ -464,3 +464,67 @@ class TestMoELayerRoutingStatsLogging:
 
         wandb_log.assert_not_called()
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_router_forward_captures_step_for_moe_routing_logging(self, monkeypatch):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+        try:
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=12,
+                num_attention_heads=4,
+                num_moe_experts=4,
+                use_cpu_initialization=True,
+                moe_token_dispatcher_type="alltoall",
+                moe_router_load_balancing_type="none",
+                moe_router_topk=1,
+                moe_capacity_priced_routing=True,
+                moe_cp_log_interval=1000,
+                add_bias_linear=False,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+            )
+            submodules = get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False)
+            moe_layer = MoELayer(config, submodules.mlp.submodules).cuda()
+            moe_layer.train()
+            moe_layer.set_layer_number(1)
+
+            wandb_log = Mock()
+            fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+            monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+            with torch.no_grad():
+                moe_layer.router.cp_steps.fill_(49)
+
+            hidden_states = torch.randn(
+                8,
+                2,
+                config.hidden_size,
+                device=torch.cuda.current_device(),
+                dtype=torch.bfloat16,
+            )
+
+            moe_layer(hidden_states)
+            assert int(moe_layer.router.cp_steps.item()) == 50
+            wandb_log.assert_not_called()
+
+            moe_layer(hidden_states)
+            assert int(moe_layer.router.cp_steps.item()) == 51
+
+            routing_calls = [
+                call
+                for call in wandb_log.call_args_list
+                if any(str(k).startswith("routing/layer_1/") for k in call[0][0].keys())
+            ]
+            assert len(routing_calls) == 1
+
+            args, kwargs = routing_calls[0]
+            log_dict = args[0]
+            assert kwargs == {"step": 50}
+            assert "routing/layer_1/gini" in log_dict
+            assert "routing/layer_1/entropy" in log_dict
+            assert any(k.startswith("routing/layer_1/usage_expert_") for k in log_dict)
+        finally:
+            Utils.destroy_model_parallel()
