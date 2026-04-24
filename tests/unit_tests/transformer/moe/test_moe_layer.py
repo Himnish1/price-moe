@@ -404,17 +404,21 @@ class TestMoELayerRoutingStatsLogging:
         layer.router = SimpleNamespace(cp_steps=torch.tensor([150]))
         assert layer._get_step() == 150
 
+        # scalar (0-d) tensor, as registered by CapacityPricedRouter
+        layer.router = SimpleNamespace(cp_steps=torch.tensor(200))
+        assert layer._get_step() == 200
+
         layer.router = SimpleNamespace(cp_steps=torch.tensor([]))
-        assert layer._get_step() == 0
+        assert layer._get_step() is None
 
         layer.router = SimpleNamespace(cp_steps="200")
         assert layer._get_step() == 200
 
         layer.router = SimpleNamespace(cp_steps="abc")
-        assert layer._get_step() == 0
+        assert layer._get_step() is None
 
         layer.router = None
-        assert layer._get_step() == 0
+        assert layer._get_step() is None
 
     @pytest.mark.internal
     def test_log_routing_stats_to_wandb(self, monkeypatch):
