@@ -1,5 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -385,3 +389,160 @@ class TestMoELayerRecompute:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+
+class TestMoELayerRoutingStatsLogging:
+    """Tests for MoELayer WandB routing stats logging helpers."""
+
+    class _DummyLayer:
+        _get_step = MoELayer._get_step
+
+    @pytest.mark.internal
+    def test_get_step_handles_tensor_and_missing_values(self):
+        layer = self._DummyLayer()
+
+        layer.router = SimpleNamespace(cp_steps=torch.tensor([150]))
+        assert layer._get_step() == 150
+
+        # scalar (0-d) tensor, as registered by CapacityPricedRouter
+        layer.router = SimpleNamespace(cp_steps=torch.tensor(200))
+        assert layer._get_step() == 200
+
+        layer.router = SimpleNamespace(cp_steps=torch.tensor([]))
+        assert layer._get_step() is None
+
+        layer.router = SimpleNamespace(cp_steps="200")
+        assert layer._get_step() == 200
+
+        layer.router = SimpleNamespace(cp_steps="abc")
+        assert layer._get_step() is None
+
+        layer.router = None
+        assert layer._get_step() is None
+
+    @pytest.mark.internal
+    def test_log_routing_stats_to_wandb(self, monkeypatch):
+        layer = self._DummyLayer()
+        layer.layer_number = 2
+        layer.router = SimpleNamespace(cp_steps=torch.tensor([100]))
+
+        wandb_log = Mock()
+        fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        routing_map = torch.tensor(
+            [
+                [1, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+            ],
+            dtype=torch.int64,
+        )
+
+        MoELayer._log_routing_stats(layer, routing_map)
+
+        wandb_log.assert_called_once()
+        args, kwargs = wandb_log.call_args
+        log_dict = args[0]
+
+        assert kwargs == {"step": 100}
+        assert log_dict["routing/layer_2/gini"] == pytest.approx(1.0 / 6.0, rel=1e-6)
+        assert log_dict["routing/layer_2/entropy"] == pytest.approx(0.94639463, rel=1e-6)
+        assert log_dict["routing/layer_2/usage_expert_0"] == 2.0
+        assert log_dict["routing/layer_2/usage_expert_1"] == 1.0
+        assert log_dict["routing/layer_2/usage_expert_2"] == 1.0
+
+    @pytest.mark.internal
+    def test_log_routing_stats_respects_log_interval(self, monkeypatch):
+        layer = self._DummyLayer()
+        layer.layer_number = 1
+        layer.router = SimpleNamespace(cp_steps=torch.tensor([101]))
+
+        wandb_log = Mock()
+        fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        routing_map = torch.tensor([[1, 0], [0, 1]], dtype=torch.int64)
+        MoELayer._log_routing_stats(layer, routing_map)
+
+        wandb_log.assert_not_called()
+
+    @pytest.mark.internal
+    def test_log_routing_stats_skips_when_step_is_unavailable(self, monkeypatch):
+        layer = self._DummyLayer()
+        layer.layer_number = 1
+        layer.router = SimpleNamespace()
+
+        wandb_log = Mock()
+        fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        routing_map = torch.tensor([[1, 0], [0, 1]], dtype=torch.int64)
+        MoELayer._log_routing_stats(layer, routing_map)
+
+        wandb_log.assert_not_called()
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_router_forward_captures_step_for_moe_routing_logging(self, monkeypatch):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+        try:
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=12,
+                num_attention_heads=4,
+                num_moe_experts=4,
+                use_cpu_initialization=True,
+                moe_token_dispatcher_type="alltoall",
+                moe_router_load_balancing_type="none",
+                moe_router_topk=1,
+                moe_capacity_priced_routing=True,
+                moe_cp_log_interval=1000,
+                add_bias_linear=False,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+            )
+            submodules = get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False)
+            moe_layer = MoELayer(config, submodules.mlp.submodules).cuda()
+            moe_layer.train()
+            moe_layer.set_layer_number(1)
+
+            wandb_log = Mock()
+            fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+            monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+            with torch.no_grad():
+                moe_layer.router.cp_steps.fill_(49)
+
+            hidden_states = torch.randn(
+                8,
+                2,
+                config.hidden_size,
+                device=torch.cuda.current_device(),
+                dtype=torch.bfloat16,
+            )
+
+            moe_layer(hidden_states)
+            assert int(moe_layer.router.cp_steps.item()) == 50
+            wandb_log.assert_not_called()
+
+            moe_layer(hidden_states)
+            assert int(moe_layer.router.cp_steps.item()) == 51
+
+            routing_calls = [
+                call
+                for call in wandb_log.call_args_list
+                if any(str(k).startswith("routing/layer_1/") for k in call[0][0].keys())
+            ]
+            assert len(routing_calls) == 1
+
+            args, kwargs = routing_calls[0]
+            log_dict = args[0]
+            assert kwargs == {"step": 50}
+            assert "routing/layer_1/gini" in log_dict
+            assert "routing/layer_1/entropy" in log_dict
+            assert any(k.startswith("routing/layer_1/usage_expert_") for k in log_dict)
+        finally:
+            Utils.destroy_model_parallel()
