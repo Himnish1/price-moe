@@ -1,5 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -385,3 +389,78 @@ class TestMoELayerRecompute:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+
+class TestMoELayerRoutingStatsLogging:
+    """Tests for MoELayer WandB routing stats logging helpers."""
+
+    class _DummyLayer:
+        _get_step = MoELayer._get_step
+
+    @pytest.mark.internal
+    def test_get_step_handles_tensor_and_missing_values(self):
+        layer = self._DummyLayer()
+
+        layer.router = SimpleNamespace(cp_steps=torch.tensor([150]))
+        assert layer._get_step() == 150
+
+        layer.router = SimpleNamespace(cp_steps=torch.tensor([]))
+        assert layer._get_step() == 0
+
+        layer.router = SimpleNamespace(cp_steps="200")
+        assert layer._get_step() == 200
+
+        layer.router = SimpleNamespace(cp_steps="abc")
+        assert layer._get_step() == 0
+
+        layer.router = None
+        assert layer._get_step() == 0
+
+    @pytest.mark.internal
+    def test_log_routing_stats_to_wandb(self, monkeypatch):
+        layer = self._DummyLayer()
+        layer.layer_number = 2
+        layer.router = SimpleNamespace(cp_steps=torch.tensor([100]))
+
+        wandb_log = Mock()
+        fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        routing_map = torch.tensor(
+            [
+                [1, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+            ],
+            dtype=torch.int64,
+        )
+
+        MoELayer._log_routing_stats(layer, routing_map)
+
+        wandb_log.assert_called_once()
+        args, kwargs = wandb_log.call_args
+        log_dict = args[0]
+
+        assert kwargs == {"step": 100}
+        assert log_dict["routing/layer_2/gini"] == pytest.approx(1.0 / 6.0, rel=1e-6)
+        assert log_dict["routing/layer_2/entropy"] == pytest.approx(0.94639463, rel=1e-6)
+        assert log_dict["routing/layer_2/usage_expert_0"] == 2.0
+        assert log_dict["routing/layer_2/usage_expert_1"] == 1.0
+        assert log_dict["routing/layer_2/usage_expert_2"] == 1.0
+
+    @pytest.mark.internal
+    def test_log_routing_stats_respects_log_interval(self, monkeypatch):
+        layer = self._DummyLayer()
+        layer.layer_number = 1
+        layer.router = SimpleNamespace(cp_steps=torch.tensor([101]))
+
+        wandb_log = Mock()
+        fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        routing_map = torch.tensor([[1, 0], [0, 1]], dtype=torch.int64)
+        MoELayer._log_routing_stats(layer, routing_map)
+
+        wandb_log.assert_not_called()
+

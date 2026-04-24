@@ -529,6 +529,22 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    def _get_step(self) -> int:
+        """Best-effort training step for metrics logging."""
+        cp_steps = getattr(getattr(self, "router", None), "cp_steps", None)
+        if cp_steps is None:
+            return 0
+
+        if torch.is_tensor(cp_steps):
+            if cp_steps.numel() == 0:
+                return 0
+            return int(cp_steps.reshape(-1)[0].item())
+
+        try:
+            return int(cp_steps)
+        except (TypeError, ValueError):
+            return 0
+
     def _log_routing_stats(self, routing_map: torch.Tensor):
         """Log Gini and entropy to WandB."""
         import math
