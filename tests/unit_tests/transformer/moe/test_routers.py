@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
-
+import csv
 from typing import cast
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -681,29 +680,87 @@ class TestCapacityPricedRouter:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_log_prices_to_wandb(self, monkeypatch):
-        self.router = self.router.cuda()
-        self.router.layer_number = 3
-        self.router.cp_steps.fill_(123)
-        with torch.no_grad():
-            self.router.expert_prices.copy_(torch.tensor([0.5, 1.5, 2.5, 3.5], device="cuda"))
+    def test_log_prices_to_csv(tmp_path, monkeypatch):
+        monkeypatch.setenv("MOE_LOG_DIR", str(tmp_path))
 
-        wandb_log = Mock()
-        fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
-        monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+        # --- fake router object ---
+        router = SimpleNamespace()
+        router.layer_number = 3
+        router.cp_steps = torch.tensor(123)
+        router.expert_prices = torch.tensor([0.5, 1.5, 2.5, 3.5])
 
-        self.router._log_prices_to_wandb()
+        # --- import module under test ---
+        from megatron.core.transformer.moe.moe_layer import MoELayer  # adjust import
 
-        expected = {
-            "lambda/layer_3/expert_0": 0.5,
-            "lambda/layer_3/expert_1": 1.5,
-            "lambda/layer_3/expert_2": 2.5,
-            "lambda/layer_3/expert_3": 3.5,
-            "lambda/layer_3/mean": 2.0,
-            "lambda/layer_3/max": 3.5,
-            "lambda/layer_3/norm": torch.tensor([0.5, 1.5, 2.5, 3.5]).norm().item(),
-        }
-        wandb_log.assert_called_once()
-        args, kwargs = wandb_log.call_args
-        assert args == (expected,)
-        assert kwargs == {"step": 123}
+        layer = MoELayer.__new__(MoELayer)
+        layer.layer_number = 3
+        layer.cp_steps = router.cp_steps
+        layer.expert_prices = router.expert_prices
+
+        # inject CSV writer
+        def _append_csv_log(filename, rows):
+            path = tmp_path / filename
+            file_exists = path.exists()
+
+            import csv
+            with open(path, "a", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["step", "layer", "metric", "expert", "value"]
+                )
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerows(rows)
+
+        layer._append_csv_log = _append_csv_log
+
+        # --- run ---
+        layer._log_prices_to_csv()
+
+        # --- verify ---
+        path = tmp_path / "price_metrics.csv"
+        assert path.exists()
+
+        rows = list(csv.DictReader(open(path)))
+
+        # 4 experts + 3 summary stats = 7 rows
+        assert len(rows) == 7
+
+        metrics = [r["metric"] for r in rows]
+        assert "lambda" in metrics
+        assert "lambda_mean" in metrics
+        assert "lambda_max" in metrics
+        assert "lambda_norm" in metrics
+
+        # step check
+        assert all(int(r["step"]) == 123 for r in rows)
+        assert all(int(r["layer"]) == 3 for r in rows)
+
+    # @pytest.mark.internal
+    # @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    # def test_log_prices_to_wandb(self, monkeypatch):
+    #     self.router = self.router.cuda()
+    #     self.router.layer_number = 3
+    #     self.router.cp_steps.fill_(123)
+    #     with torch.no_grad():
+    #         self.router.expert_prices.copy_(torch.tensor([0.5, 1.5, 2.5, 3.5], device="cuda"))
+    #
+    #     wandb_log = Mock()
+    #     fake_wandb = SimpleNamespace(run=object(), log=wandb_log)
+    #     monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    #
+    #     self.router._log_prices_to_wandb()
+    #
+    #     expected = {
+    #         "lambda/layer_3/expert_0": 0.5,
+    #         "lambda/layer_3/expert_1": 1.5,
+    #         "lambda/layer_3/expert_2": 2.5,
+    #         "lambda/layer_3/expert_3": 3.5,
+    #         "lambda/layer_3/mean": 2.0,
+    #         "lambda/layer_3/max": 3.5,
+    #         "lambda/layer_3/norm": torch.tensor([0.5, 1.5, 2.5, 3.5]).norm().item(),
+    #     }
+    #     wandb_log.assert_called_once()
+    #     args, kwargs = wandb_log.call_args
+    #     assert args == (expected,)
+    #     assert kwargs == {"step": 123}

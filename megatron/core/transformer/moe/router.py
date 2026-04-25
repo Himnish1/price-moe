@@ -544,30 +544,51 @@ class CapacityPricedRouter(Router):
         # --- logging ---
         moe_cp_log_interval = max(int(getattr(self.config, 'moe_cp_log_interval', 50)), 1)
         if int(self.cp_steps.item()) % moe_cp_log_interval == 0:
-            self._log_prices_to_wandb()
+            self._log_prices_to_csv()
 
-    def _log_prices_to_wandb(self):
-        """Log per-expert lambda values to WandB."""
-        try:
-            import wandb
-            if wandb.run is None:
-                return
-        except ImportError:
-            return
-
+    def _log_prices_to_csv(self):
+        """Log expert prices to CSV."""
         prices = self.expert_prices.detach().cpu()
         step = int(self.cp_steps.item())
 
-        log_dict = {
-            f'lambda/layer_{self.layer_number}/expert_{i}': prices[i].item()
-            for i in range(len(prices))
-        }
-        log_dict.update({
-            f'lambda/layer_{self.layer_number}/mean': prices.mean().item(),
-            f'lambda/layer_{self.layer_number}/max': prices.max().item(),
-            f'lambda/layer_{self.layer_number}/norm': prices.norm().item(),
-        })
-        wandb.log(log_dict, step=step)
+        rows = []
+
+        for i in range(len(prices)):
+            rows.append(
+                {
+                    "step": step,
+                    "layer": self.layer_number,
+                    "metric": "lambda",
+                    "expert": i,
+                    "value": prices[i].item(),
+                }
+            )
+
+        rows.extend([
+            {
+                "step": step,
+                "layer": self.layer_number,
+                "metric": "lambda_mean",
+                "expert": "",
+                "value": prices.mean().item(),
+            },
+            {
+                "step": step,
+                "layer": self.layer_number,
+                "metric": "lambda_max",
+                "expert": "",
+                "value": prices.max().item(),
+            },
+            {
+                "step": step,
+                "layer": self.layer_number,
+                "metric": "lambda_norm",
+                "expert": "",
+                "value": prices.norm().item(),
+            },
+        ])
+
+        self._append_csv_log("price_metrics.csv", rows)
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         self._maintain_float32_expert_prices()

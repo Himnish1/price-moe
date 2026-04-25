@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from typing import Optional, Protocol
 
 import torch
+import csv
+import os
+import threading
+from pathlib import Path
 
 from megatron.core import parallel_state, tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -54,6 +58,7 @@ if HAVE_TE:
 else:
     TELinear, te_checkpoint = None, None
 
+_csv_lock = threading.Lock()
 
 class ExpertsInterface(Protocol):
     """Interface for the experts used in an MoELayer."""
@@ -545,21 +550,42 @@ class MoELayer(BaseMoELayer):
         except (TypeError, ValueError):
             return None
 
+    def _append_csv_log(self, filename: str, rows: list[dict]):
+        """
+        Append rows to CSV safely.
+        Format:
+        step,layer,metric,expert,value
+        """
+        log_dir = Path(os.getenv("MOE_LOG_DIR", "./moe_logs"))
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        filepath = log_dir / filename
+        file_exists = filepath.exists()
+
+        with _csv_lock:
+            with open(filepath, "a", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["step", "layer", "metric", "expert", "value"]
+                )
+
+                if not file_exists:
+                    writer.writeheader()
+
+                writer.writerows(rows)
+
     def _log_routing_stats(self, routing_map: torch.Tensor):
-        """Log Gini and entropy to WandB."""
+        """Log routing metrics to CSV."""
         import math
-        try:
-            import wandb
-            if wandb.run is None:
-                return
-        except ImportError:
-            return
 
         step = self._get_step()
         if step is None:
+            print(f"MoE Layer {self.layer_number} - Step {step} is None")
             return
+
         log_interval = 50
         if step % log_interval != 0:
+            print(f"MoE Layer {self.layer_number} - Step {step} not 50 yet, skipping logging")
             return
 
         with torch.no_grad():
@@ -576,19 +602,42 @@ class MoELayer(BaseMoELayer):
 
             # Entropy
             probs = usage / (usage.sum() + 1e-8)
-            entropy = float(-sum(p * math.log(p + 1e-8) for p in probs.tolist()))
-            normalized_entropy = entropy / math.log(n) if math.log(n) > 0 else 0.0
+            entropy = float(
+                -sum(p * math.log(p + 1e-8) for p in probs.tolist())
+            )
+            normalized_entropy = (
+                entropy / math.log(n) if math.log(n) > 0 else 0.0
+            )
 
-            log_dict = {
-                f'routing/layer_{self.layer_number}/gini': gini,
-                f'routing/layer_{self.layer_number}/entropy': normalized_entropy,
-            }
+            rows = [
+                {
+                    "step": step,
+                    "layer": self.layer_number,
+                    "metric": "gini",
+                    "expert": "",
+                    "value": gini,
+                },
+                {
+                    "step": step,
+                    "layer": self.layer_number,
+                    "metric": "entropy",
+                    "expert": "",
+                    "value": normalized_entropy,
+                },
+            ]
 
-            # Per-expert usage
             for i, u in enumerate(usage.tolist()):
-                log_dict[f'routing/layer_{self.layer_number}/usage_expert_{i}'] = u
+                rows.append(
+                    {
+                        "step": step,
+                        "layer": self.layer_number,
+                        "metric": "usage",
+                        "expert": i,
+                        "value": u,
+                    }
+                )
 
-            wandb.log(log_dict, step=step)
+            self._append_csv_log("routing_metrics.csv", rows)
 
     def forward(
         self,
