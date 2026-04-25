@@ -542,9 +542,12 @@ class CapacityPricedRouter(Router):
                 dtype=torch.float32,
             )
         target_capacity = self.slack_capacity * expert_capacity
-
-        self.expert_prices.add_(self.price_learning_rate * (usage - target_capacity))
-        self.expert_prices.clamp_(min=0.0)
+        
+        # Update prices using tatonnement: lambda += eta * (usage - alpha * capacity)
+        # Use out-of-place update to avoid in-place modification error when gradients are tracked
+        new_prices = self.expert_prices + self.price_learning_rate * (usage - target_capacity)
+        with torch.no_grad():
+            self.expert_prices.copy_(new_prices.clamp(min=0.0))
 
         # --- logging ---
         moe_cp_log_interval = max(int(getattr(self.config, 'moe_cp_log_interval', 50)), 1)
