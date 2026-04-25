@@ -10,7 +10,11 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
+from megatron.core.transformer.moe.moe_utils import (
+    get_moe_layer_wise_logging_tracker,
+    get_updated_expert_bias,
+    router_gating_linear,
+)
 from megatron.core.transformer.moe.router import CapacityPricedRouter, Router
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -681,10 +685,70 @@ class TestCapacityPricedRouter:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_capacity_pricing_loss(self):
+        self.router = self.router.cuda()
+        self.router.train()
+        
+        # Enable capacity pricing loss
+        self.router.config.moe_cp_loss_coeff = 0.5
+        # Disable other losses to isolate
+        self.router.config.moe_z_loss_coeff = None
+        self.router.config.moe_aux_loss_coeff = 0.0
+        self.router.routing_type = "none"
+        self.router.config.moe_router_load_balancing_type = "none"
+
+        # Set specific expert prices: expert 0 is very expensive
+        with torch.no_grad():
+            self.router.expert_prices.copy_(torch.tensor([100.0, 0.0, 0.0, 0.0], device="cuda"))
+
+        # Hidden states that would normally result in some probability for expert 0
+        hidden_states = torch.randn(
+            (8, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        
+        probs, _ = self.router(hidden_states)
+        
+        # Verify loss is tracked
+        tracker = get_moe_layer_wise_logging_tracker()
+        if 'capacity_pricing_loss' in tracker:
+             tracker['capacity_pricing_loss']['values'].zero_()
+
+        self.router.zero_grad()
+        # We need a backward pass to trigger the loss through attach_and_log_load_balancing_loss
+        probs.sum().backward()
+
+        # Check that capacity_pricing_loss was indeed logged
+        assert 'capacity_pricing_loss' in tracker
+        # Loss should be > 0 because softmax(logits) > 0 for all experts
+        assert tracker['capacity_pricing_loss']['values'].sum() > 0
+
+        # Verify that expert_prices influence the gradient
+        # Gradients of expert 0's routing weights should be pushed strongly
+        # since its price is high and we are minimizing sum(price * softmax(logits))
+        router_weight_grad = self.router.weight.grad.clone()
+        
+        # Now set expert 0 price to 0 and compare gradients
+        self.router.zero_grad()
+        with torch.no_grad():
+            self.router.expert_prices.zero_()
+        
+        probs2, _ = self.router(hidden_states)
+        probs2.sum().backward()
+        
+        router_weight_grad_no_price = self.router.weight.grad.clone()
+        
+        # The gradients should be different
+        assert not torch.allclose(router_weight_grad, router_weight_grad_no_price)
+        
+        # Restore config
+        self.router.config.moe_cp_loss_coeff = 0.0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_log_prices_to_wandb(self, monkeypatch):
         self.router = self.router.cuda()
         self.router.layer_number = 3
-        self.router.cp_steps.fill_(123)
+        self.router.training_step.fill_(123)
         with torch.no_grad():
             self.router.expert_prices.copy_(torch.tensor([0.5, 1.5, 2.5, 3.5], device="cuda"))
 
