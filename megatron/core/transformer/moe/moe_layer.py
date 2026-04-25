@@ -164,6 +164,11 @@ class BaseMoELayer(MegatronModule, ABC):
         self.config = config
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
+        self.register_buffer(
+            'training_step',
+            torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
+            persistent=False,
+        )
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
         self.attn_tp_group = pg_collection.tp
@@ -531,19 +536,7 @@ class MoELayer(BaseMoELayer):
 
     def _get_step(self) -> Optional[int]:
         """Best-effort training step for metrics logging. Returns None if step is unavailable."""
-        cp_steps = getattr(getattr(self, "router", None), "cp_steps", None)
-        if cp_steps is None:
-            return None
-
-        if torch.is_tensor(cp_steps):
-            if cp_steps.numel() == 0:
-                return None
-            return int(cp_steps.reshape(-1)[0].item())
-
-        try:
-            return int(cp_steps)
-        except (TypeError, ValueError):
-            return None
+        return int(self.training_step.item())
 
     def _log_routing_stats(self, routing_map: torch.Tensor):
         """Log Gini and entropy to WandB."""
@@ -623,6 +616,11 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            if self.training and torch.is_grad_enabled():
+                self.training_step += 1
+                if self.router is not None:
+                    self.router.training_step += 1
+
             expert_usage_counts = None
             update_cp_prices = (
                 self.config.moe_capacity_priced_routing

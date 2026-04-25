@@ -69,6 +69,11 @@ class Router(ABC, MegatronModule):
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
+        self.register_buffer(
+            'training_step',
+            torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
+            persistent=False,
+        )
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -543,7 +548,7 @@ class CapacityPricedRouter(Router):
 
         # --- logging ---
         moe_cp_log_interval = max(int(getattr(self.config, 'moe_cp_log_interval', 50)), 1)
-        if int(self.cp_steps.item()) % moe_cp_log_interval == 0:
+        if int(self.training_step.item()) % moe_cp_log_interval == 0:
             self._log_prices_to_wandb()
 
     def _log_prices_to_wandb(self):
@@ -556,7 +561,7 @@ class CapacityPricedRouter(Router):
             return
 
         prices = self.expert_prices.detach().cpu()
-        step = int(self.cp_steps.item())
+        step = int(self.training_step.item())
 
         log_dict = {
             f'lambda/layer_{self.layer_number}/expert_{i}': prices[i].item()
