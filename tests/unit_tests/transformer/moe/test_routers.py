@@ -687,6 +687,7 @@ class TestCapacityPricedRouter:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_capacity_pricing_loss(self):
         self.router = self.router.cuda()
+        self.router.set_layer_number(1)
         self.router.train()
         
         # Enable capacity pricing loss
@@ -706,21 +707,21 @@ class TestCapacityPricedRouter:
             (8, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
         
-        probs, _ = self.router(hidden_states)
-        
-        # Verify loss is tracked
+        # Clear tracker before forward pass
         tracker = get_moe_layer_wise_logging_tracker()
         if 'capacity_pricing_loss' in tracker:
              tracker['capacity_pricing_loss']['values'].zero_()
 
-        self.router.zero_grad()
-        # We need a backward pass to trigger the loss through attach_and_log_load_balancing_loss
-        probs.sum().backward()
-
-        # Check that capacity_pricing_loss was indeed logged
+        probs, _ = self.router(hidden_states)
+        
+        # Check that capacity_pricing_loss was indeed logged during forward
         assert 'capacity_pricing_loss' in tracker
         # Loss should be > 0 because softmax(logits) > 0 for all experts
         assert tracker['capacity_pricing_loss']['values'].sum() > 0
+
+        self.router.zero_grad()
+        # We need a backward pass to ensure gradients are computed
+        probs.sum().backward()
 
         # Verify that expert_prices influence the gradient
         # Gradients of expert 0's routing weights should be pushed strongly
