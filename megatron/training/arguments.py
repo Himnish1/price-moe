@@ -3144,6 +3144,9 @@ def _add_moe_args(parser):
     if '--moe-cp-log-interval' not in parser._option_string_actions:
         group.add_argument('--moe-cp-log-interval', type=int, default=100,
                            help='Logging interval for CP-MoE diagnostics.')
+    if '--moe-cp-loss-coeff' not in parser._option_string_actions:
+        group.add_argument('--moe-cp-loss-coeff', type=float, default=0.01,
+                           help='Scaling coefficient for the CP-MoE loss term.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 

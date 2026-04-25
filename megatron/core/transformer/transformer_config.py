@@ -729,6 +729,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_cp_log_interval: int = 100
     """Logging interval for CP-MoE price logging when enabled."""
 
+    moe_cp_loss_coeff: float = 0.01
+    """Scaling coefficient for the capacity pricing loss (Σ λ_i * Σ s_{i,t})."""
+
     moe_router_bias_update_rate: float = 1e-3
     """The expert bias is updated based on the number of assigned tokens to each expert
     in a global batch, where the bias is increased for the experts with less assigned tokens

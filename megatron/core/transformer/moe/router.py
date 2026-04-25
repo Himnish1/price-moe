@@ -609,6 +609,52 @@ class CapacityPricedRouter(Router):
         )
         return probs, routing_map
 
+    def _apply_routing_regularization(
+            self,
+            logits: torch.Tensor,
+            probs: torch.Tensor,
+            routing_map: torch.Tensor,
+            padding_mask: Optional[torch.Tensor],
+            seq_length: int,
+            bsz: int,
+            aux_logits: Optional[torch.Tensor] = None,
+    ):
+        # 1. Call base class for standard logic (dropping, etc.)
+        probs, routing_map = super()._apply_routing_regularization(
+            logits, probs, routing_map, padding_mask, seq_length, bsz, aux_logits
+        )
+
+        # 2. Add Capacity Pricing Loss (independent of standard aux_loss)
+        if self.training and torch.is_grad_enabled():
+            # Use logits or aux_logits to get differentiable scores (soft usage)
+            # We typically use softmax scores as the surrogate s_{i,t}
+            scores = torch.softmax(logits, dim=-1)
+            if padding_mask is not None:
+                scores = scores * (~padding_mask).unsqueeze(-1).to(dtype=scores.dtype)
+
+            # Sum of scores per expert: Σ_t s_{i,t}
+            soft_usage = scores.sum(dim=0)
+
+            # Compute Pricing Loss: Σ λ_i · Σ s_{i,t}
+            # Note: We detach expert_prices to treat them as constants (dual variables)
+            # for the gradient of the primal objective.
+            pricing_loss = torch.sum(self.expert_prices.detach() * soft_usage)
+
+            # Attach the loss to the graph so it can be backpropagated
+            # We reuse the attach_and_log_load_balancing_loss helper
+            # You might want to define a specific coeff for this, or reuse moe_aux_loss_coeff
+            pricing_loss_coeff = getattr(self.config, 'moe_cp_loss_coeff', 1.0)
+
+            probs = self.attach_and_log_load_balancing_loss(
+                probs,
+                pricing_loss_coeff,
+                pricing_loss * pricing_loss_coeff,
+                'capacity_pricing_loss',
+                self.tp_cp_group
+            )
+
+        return probs, routing_map
+
     def _load_from_state_dict(self, *args, **kwargs):
         self._maintain_float32_expert_prices()
         return super()._load_from_state_dict(*args, **kwargs)
