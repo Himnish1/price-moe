@@ -2488,6 +2488,15 @@ def post_training_step_callbacks(
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
 
+    # Update capacity pricing prices after optimizer step
+    if args.moe_capacity_priced_routing:
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+        with torch.no_grad():
+            for model_chunk in model:
+                for module in model_chunk.modules():
+                    if isinstance(module, MoELayer) and hasattr(module.router, 'update_prices'):
+                        module.router.update_prices()
+
     # Return updated FLOPs accumulator so caller can persist the reset
     return num_floating_point_operations_since_last_log_event
 

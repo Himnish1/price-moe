@@ -485,6 +485,11 @@ class CapacityPricedRouter(Router):
             torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
             persistent=False,
         )
+        self.register_buffer(
+            'cached_expert_usage',
+            torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
+            persistent=False,
+        )
 
     def _maintain_float32_expert_prices(self):
         if self.expert_prices.dtype != torch.float32:
@@ -522,8 +527,11 @@ class CapacityPricedRouter(Router):
 
         return probs, routing_map
 
-    def update_prices(self, expert_usage_counts: torch.Tensor):
+    def update_prices(self, expert_usage_counts: Optional[torch.Tensor] = None):
         """Update prices using tatonnement: lambda += eta * (usage - alpha * capacity)."""
+        if expert_usage_counts is None:
+            expert_usage_counts = self.cached_expert_usage
+
         if expert_usage_counts is None:
             return
 
@@ -542,9 +550,12 @@ class CapacityPricedRouter(Router):
                 dtype=torch.float32,
             )
         target_capacity = self.slack_capacity * expert_capacity
-
-        self.expert_prices.add_(self.price_learning_rate * (usage - target_capacity))
-        self.expert_prices.clamp_(min=0.0)
+        
+        # Update prices using tatonnement: lambda += eta * (usage - alpha * capacity)
+        # Use out-of-place update to avoid in-place modification error when gradients are tracked
+        new_prices = self.expert_prices + self.price_learning_rate * (usage - target_capacity)
+        with torch.no_grad():
+            self.expert_prices.copy_(new_prices.clamp(min=0.0))
 
         # --- logging ---
         moe_cp_log_interval = max(int(getattr(self.config, 'moe_cp_log_interval', 50)), 1)

@@ -665,7 +665,7 @@ class MoELayer(BaseMoELayer):
 
                 if update_cp_prices and expert_usage_counts is not None:
                     with torch.no_grad():
-                        self.router.update_prices(expert_usage_counts)
+                        self.router.cached_expert_usage.copy_(expert_usage_counts.detach())
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
