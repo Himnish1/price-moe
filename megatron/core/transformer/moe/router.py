@@ -485,6 +485,11 @@ class CapacityPricedRouter(Router):
             torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
             persistent=False,
         )
+        self.register_buffer(
+            'cached_expert_usage',
+            torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
+            persistent=False,
+        )
 
     def _maintain_float32_expert_prices(self):
         if self.expert_prices.dtype != torch.float32:
@@ -522,8 +527,11 @@ class CapacityPricedRouter(Router):
 
         return probs, routing_map
 
-    def update_prices(self, expert_usage_counts: torch.Tensor):
+    def update_prices(self, expert_usage_counts: Optional[torch.Tensor] = None):
         """Update prices using tatonnement: lambda += eta * (usage - alpha * capacity)."""
+        if expert_usage_counts is None:
+            expert_usage_counts = self.cached_expert_usage
+
         if expert_usage_counts is None:
             return
 

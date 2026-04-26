@@ -633,7 +633,8 @@ class TestCapacityPricedRouter:
         with torch.no_grad():
             self.router.expert_prices.zero_()
             usage = torch.tensor([8.0, 0.0, 4.0, 4.0], device="cuda")
-            self.router.update_prices(usage)
+            self.router.cached_expert_usage.copy_(usage)
+            self.router.update_prices()
 
             # target = alpha * (sum(usage)/num_experts) = 0.5 * 4 = 2
             # new price = clamp(0 + lr * (usage - 2), min=0)
