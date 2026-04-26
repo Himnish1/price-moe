@@ -497,8 +497,10 @@ class CapacityPricedRouter(Router):
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
 
+        # Treat prices as dual variables (constants) in the primal backward pass.
+        detached_prices = self.expert_prices.detach().unsqueeze(0).to(dtype=logits.dtype)
         if self.config.moe_cp_routing_offset:
-            dispatch_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            dispatch_logits = logits - detached_prices
         else:
             dispatch_logits = logits
         top1_indices = torch.argmax(dispatch_logits, dim=-1, keepdim=True)
@@ -595,8 +597,11 @@ class CapacityPricedRouter(Router):
             padding_mask = padding_mask.reshape(-1)
 
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+        # Detach prices to avoid version-counter mismatches when prices are updated
+        # later in the same forward under no_grad.
+        detached_prices = self.expert_prices.detach().unsqueeze(0).to(dtype=logits.dtype)
         if self.config.moe_cp_routing_offset:
-            aux_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            aux_logits = logits - detached_prices
         else:
             aux_logits = logits
 
