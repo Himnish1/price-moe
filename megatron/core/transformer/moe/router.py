@@ -490,6 +490,17 @@ class CapacityPricedRouter(Router):
             torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
             persistent=False,
         )
+        # number of steps accumulated into cached_expert_usage
+        self.register_buffer(
+            'cp_accum_steps',
+            torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
+            persistent=False,
+        )
+        self.register_buffer(
+            'current_expert_usage',
+            torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
+            persistent=False,
+        )
 
     def _maintain_float32_expert_prices(self):
         if self.expert_prices.dtype != torch.float32:
@@ -530,37 +541,89 @@ class CapacityPricedRouter(Router):
     def update_prices(self, expert_usage_counts: Optional[torch.Tensor] = None):
         """Update prices using tatonnement: lambda += eta * (usage - alpha * capacity)."""
         if expert_usage_counts is None:
-            expert_usage_counts = self.cached_expert_usage
+            # nothing to accumulate
+            expert_usage_counts = self.current_expert_usage
 
-        if expert_usage_counts is None:
+        # ensure float32 and device match
+        usage = expert_usage_counts.to(device=self.cached_expert_usage.device, dtype=torch.float32)
+
+        # accumulate usage and increment accumulator counter
+        with torch.no_grad():
+            self.cached_expert_usage += usage
+            self.cp_accum_steps += 1
+
+        # Only perform the dual update every `price_update_frequency` accumulation steps
+        freq = max(int(self.price_update_frequency), 1)
+        if int(self.cp_accum_steps.item()) < freq:
             return
 
+        # compute averaged usage over the accumulation window
+        accum_steps = float(self.cp_accum_steps.item())
+        avg_usage = (self.cached_expert_usage / accum_steps).to(device=self.expert_prices.device, dtype=torch.float32)
+
+        # maintain float32 expert prices
         self._maintain_float32_expert_prices()
-        self.cp_steps += 1
-        if int(self.cp_steps.item()) % self.price_update_frequency != 0:
-            return
 
-        usage = expert_usage_counts.to(device=self.expert_prices.device, dtype=torch.float32)
+        # increment global cp_steps (kept for logging parity)
+        self.cp_steps += 1
+
+        # compute expert capacity and target
         if self.config.moe_cp_expert_capacity is None:
-            expert_capacity = usage.sum() / max(self.config.num_moe_experts, 1)
+            expert_capacity = avg_usage.sum() / max(self.config.num_moe_experts, 1)
         else:
             expert_capacity = torch.tensor(
                 float(self.config.moe_cp_expert_capacity),
-                device=usage.device,
+                device=avg_usage.device,
                 dtype=torch.float32,
             )
         target_capacity = self.slack_capacity * expert_capacity
-        
-        # Update prices using tatonnement: lambda += eta * (usage - alpha * capacity)
-        # Use out-of-place update to avoid in-place modification error when gradients are tracked
-        new_prices = self.expert_prices + self.price_learning_rate * (usage - target_capacity)
-        with torch.no_grad():
-            self.expert_prices.copy_(new_prices.clamp(min=0.0))
 
-        # --- logging ---
+        # tatonnement update on averaged usage
+        new_prices = self.expert_prices + self.price_learning_rate * (avg_usage - target_capacity)
+
+        with torch.no_grad():
+            # clamp non-negative and copy
+            self.expert_prices.copy_(new_prices.clamp(min=0.0))
+            # reset accumulator
+            self.cached_expert_usage.zero_()
+            self.cp_accum_steps.zero_()
+
+        # optional logging
         moe_cp_log_interval = max(int(getattr(self.config, 'moe_cp_log_interval', 50)), 1)
         if int(self.training_step.item()) % moe_cp_log_interval == 0:
             self._log_prices_to_wandb()
+        # if expert_usage_counts is None:
+        #     expert_usage_counts = self.cached_expert_usage
+        #
+        # if expert_usage_counts is None:
+        #     return
+        #
+        # self._maintain_float32_expert_prices()
+        # self.cp_steps += 1
+        # if int(self.cp_steps.item()) % self.price_update_frequency != 0:
+        #     return
+        #
+        # usage = expert_usage_counts.to(device=self.expert_prices.device, dtype=torch.float32)
+        # if self.config.moe_cp_expert_capacity is None:
+        #     expert_capacity = usage.sum() / max(self.config.num_moe_experts, 1)
+        # else:
+        #     expert_capacity = torch.tensor(
+        #         float(self.config.moe_cp_expert_capacity),
+        #         device=usage.device,
+        #         dtype=torch.float32,
+        #     )
+        # target_capacity = self.slack_capacity * expert_capacity
+        #
+        # # Update prices using tatonnement: lambda += eta * (usage - alpha * capacity)
+        # # Use out-of-place update to avoid in-place modification error when gradients are tracked
+        # new_prices = self.expert_prices + self.price_learning_rate * (usage - target_capacity)
+        # with torch.no_grad():
+        #     self.expert_prices.copy_(new_prices.clamp(min=0.0))
+        #
+        # # --- logging ---
+        # moe_cp_log_interval = max(int(getattr(self.config, 'moe_cp_log_interval', 50)), 1)
+        # if int(self.training_step.item()) % moe_cp_log_interval == 0:
+        #     self._log_prices_to_wandb()
 
     def _log_prices_to_wandb(self):
         """Log per-expert lambda values to WandB."""
@@ -639,7 +702,7 @@ class CapacityPricedRouter(Router):
         if self.training and torch.is_grad_enabled():
             # Use logits or aux_logits to get differentiable scores (soft usage)
             # We typically use softmax scores as the surrogate s_{i,t}
-            scores = torch.softmax(logits, dim=-1)
+            scores = torch.softmax(aux_logits, dim=-1)
             if padding_mask is not None:
                 scores = scores * (~padding_mask).unsqueeze(-1).to(dtype=scores.dtype)
 
