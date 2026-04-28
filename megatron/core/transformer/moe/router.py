@@ -702,7 +702,7 @@ class CapacityPricedRouter(Router):
         if self.training and torch.is_grad_enabled():
             # Use logits or aux_logits to get differentiable scores (soft usage)
             # We typically use softmax scores as the surrogate s_{i,t}
-            scores = torch.softmax(aux_logits, dim=-1)
+            scores = torch.softmax(logits, dim=-1)
             if padding_mask is not None:
                 scores = scores * (~padding_mask).unsqueeze(-1).to(dtype=scores.dtype)
 
