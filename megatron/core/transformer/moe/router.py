@@ -741,9 +741,8 @@ class CapacityPricedRouter(Router):
 
             # If scale-robust routing enabled, normalize lambda by sigma_r for the loss term
             if getattr(self.config, 'moe_cp_scale_robust_routing', False):
-                # compute sigma_r consistent with routing (float)
                 with torch.no_grad():
-                    sigma_r = float(torch.std(logits.to(dtype=torch.float32)) + 1e-8)
+                    sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
                 pricing_loss = torch.sum((expert_prices_for_loss.detach() / sigma_r) * soft_usage)
             else:
                 pricing_loss = torch.sum(expert_prices_for_loss.detach() * soft_usage)
