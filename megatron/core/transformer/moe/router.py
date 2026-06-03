@@ -515,9 +515,11 @@ class CapacityPricedRouter(Router):
             if getattr(self.config, 'moe_cp_scale_robust_routing', False):
                 # Compute std dev across current batch (tokens x experts) in float32 for stability
                 with torch.no_grad():
-                    # Avoid zero std by adding eps
-                    sigma_r = float(torch.std(logits.to(dtype=torch.float32)) + 1e-8)
-                dispatch_logits = logits - (sigma_r * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype))
+                    sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
+                dispatch_logits = logits - (
+                    sigma_r.to(dtype=logits.dtype)
+                    * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+                )
             else:
                 dispatch_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
         else:
