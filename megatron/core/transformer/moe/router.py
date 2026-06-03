@@ -682,8 +682,11 @@ class CapacityPricedRouter(Router):
         if self.config.moe_cp_routing_offset:
             if getattr(self.config, 'moe_cp_scale_robust_routing', False):
                 with torch.no_grad():
-                    sigma_r = float(torch.std(logits.to(dtype=torch.float32)) + 1e-8)
-                aux_logits = logits - (sigma_r * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype))
+                    sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
+                aux_logits = logits - (
+                    sigma_r.to(dtype=logits.dtype)
+                    * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+                )
             else:
                 aux_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
         else:
