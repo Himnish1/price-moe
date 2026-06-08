@@ -637,8 +637,13 @@ class TestCapacityPricedRouter:
             self.router.update_prices()
 
             # target = alpha * (sum(usage)/num_experts) = 0.5 * 4 = 2
-            # new price = clamp(0 + lr * (usage - 2), min=0)
-            expected = torch.tensor([0.6, 0.0, 0.2, 0.2], device="cuda")
+            # standardized update: new_price = clamp(lr * ((usage - target) / sigma), min=0)
+            avg_usage = usage
+            sigma = avg_usage.to(dtype=torch.float32).std().clamp_min(1e-8)
+            target = self.router.slack_capacity * (avg_usage.sum() / float(self.router.config.num_moe_experts))
+            lr = float(self.router.price_learning_rate)
+            expected = ((avg_usage - target) / sigma) * lr
+            expected = expected.clamp(min=0.0).to(device="cuda")
             torch.testing.assert_close(self.router.expert_prices, expected)
 
     @pytest.mark.internal

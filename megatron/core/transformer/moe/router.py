@@ -581,14 +581,13 @@ class CapacityPricedRouter(Router):
             )
         target_capacity = self.slack_capacity * expert_capacity
 
-        # tatonnement update on averaged (optionally EMA-smoothed) usage
-        # Convert (usage - target_capacity) into dimensionless units by dividing
-        # by sigma_s_usage so the stored `expert_prices` stays dimensionless.
-        new_prices = self.expert_prices + (
-            self.price_learning_rate * ((avg_usage - target_capacity) / sigma_s_usage)
-        )
-
         with torch.no_grad():
+
+            # scale-robust update: divide by usage-scale to keep stored prices dimensionless
+            new_prices = self.expert_prices + (
+                self.price_learning_rate * ((avg_usage - target_capacity) / sigma_s_usage)
+            )
+
             # clamp non-negative and copy
             self.expert_prices.copy_(new_prices.clamp(min=0.0))
             # reset accumulator
