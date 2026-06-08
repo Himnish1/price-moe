@@ -478,15 +478,6 @@ class CapacityPricedRouter(Router):
             'expert_prices',
             torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
         )
-        # EMA smoothed usage (optional) for dual updates
-        if getattr(self.config, 'moe_cp_use_ema', False):
-            self.register_buffer(
-                'ema_expert_usage',
-                torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
-                persistent=False,
-            )
-        else:
-            self.ema_expert_usage = None
         # number of steps accumulated into cached_expert_usage
         self.register_buffer(
             'cp_accum_steps',
@@ -518,16 +509,13 @@ class CapacityPricedRouter(Router):
 
         # Optionally apply scale-robust routing offset: subtract sigma_r * lambda
         if self.config.moe_cp_routing_offset:
-            if getattr(self.config, 'moe_cp_scale_robust_routing', False):
-                # Compute std dev across current batch (tokens x experts) in float32 for stability
-                with torch.no_grad():
-                    sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
-                dispatch_logits = logits - (
-                    sigma_r.to(dtype=logits.dtype)
-                    * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
-                )
-            else:
-                dispatch_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            # Compute std dev across current batch (tokens x experts) in float32 for stability
+            with torch.no_grad():
+                sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
+            dispatch_logits = logits - (
+                sigma_r.to(dtype=logits.dtype)
+                * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            )
         else:
             dispatch_logits = logits
         top1_indices = torch.argmax(dispatch_logits, dim=-1, keepdim=True)
