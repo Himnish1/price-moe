@@ -675,15 +675,12 @@ class CapacityPricedRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
         # Aux logits used for aux losses: apply same routing offset logic as routing
         if self.config.moe_cp_routing_offset:
-            if getattr(self.config, 'moe_cp_scale_robust_routing', False):
-                with torch.no_grad():
-                    sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
-                aux_logits = logits - (
-                    sigma_r.to(dtype=logits.dtype)
-                    * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
-                )
-            else:
-                aux_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            with torch.no_grad():
+                sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
+            aux_logits = logits - (
+                sigma_r.to(dtype=logits.dtype)
+                * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            )
         else:
             aux_logits = logits
 
