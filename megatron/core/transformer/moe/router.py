@@ -493,6 +493,12 @@ class CapacityPricedRouter(Router):
             torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
             persistent=False,
         )
+        # Accumulated usage counts over the accumulation window (floating sum)
+        self.register_buffer(
+            'cached_expert_usage',
+            torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
+            persistent=False,
+        )
         self.register_buffer(
             'current_expert_usage',
             torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
@@ -568,15 +574,12 @@ class CapacityPricedRouter(Router):
         accum_steps = float(self.cp_accum_steps.item())
         avg_usage = (self.cached_expert_usage / accum_steps).to(device=self.expert_prices.device, dtype=torch.float32)
 
-        # Optionally smooth usage with EMA before applying tatonnement
-        if getattr(self.config, 'moe_cp_use_ema', False) and self.ema_expert_usage is not None:
-            beta = float(getattr(self.config, 'moe_cp_ema_beta', 0.99))
-            # ema = beta * ema + (1-beta) * avg_usage
-            with torch.no_grad():
-                self.ema_expert_usage.mul_(beta).add_(avg_usage * (1.0 - beta))
-            avg_usage_to_use = self.ema_expert_usage
-        else:
-            avg_usage_to_use = avg_usage
+        # Convert usage delta to the canonical dimensionless price update by
+        # dividing by the per-expert usage std (sigma_s_usage). This matches the
+        # scaling used in the pricing loss (which multiplies dimensionless prices
+        # by sigma_s to get usage units).
+        with torch.no_grad():
+            sigma_s_usage = avg_usage.to(dtype=torch.float32).std().clamp_min(1e-8)
 
         # tatonnement update on averaged (optionally EMA-smoothed) usage
         # compute expert capacity and target (same logic as earlier implementation)
@@ -585,13 +588,17 @@ class CapacityPricedRouter(Router):
         else:
             expert_capacity = torch.tensor(
                 float(self.config.moe_cp_expert_capacity),
-                device=avg_usage_to_use.device,
+                device=avg_usage.device,
                 dtype=torch.float32,
             )
         target_capacity = self.slack_capacity * expert_capacity
 
         # tatonnement update on averaged (optionally EMA-smoothed) usage
-        new_prices = self.expert_prices + self.price_learning_rate * (avg_usage_to_use - target_capacity)
+        # Convert (usage - target_capacity) into dimensionless units by dividing
+        # by sigma_s_usage so the stored `expert_prices` stays dimensionless.
+        new_prices = self.expert_prices + (
+            self.price_learning_rate * ((avg_usage - target_capacity) / sigma_s_usage)
+        )
 
         with torch.no_grad():
             # clamp non-negative and copy
@@ -730,25 +737,32 @@ class CapacityPricedRouter(Router):
             # Sum of scores per expert: Σ_t s_{i,t}
             soft_usage = scores.sum(dim=0)
 
-            # Compute Pricing Loss: Σ λ_i · Σ s_{i,t}
-            # Note: We detach expert_prices to treat them as constants (dual variables)
-            # for the gradient of the primal objective.
-            pricing_loss = torch.sum(self.expert_prices.detach() * soft_usage)
+            # Pricing loss: convert dimensionless stored expert_prices -> usage units
+            # We store `self.expert_prices` as a dimensionless canonical variable.
+            # For the loss, scale it into the soft-usage units by multiplying by
+            # sigma_s (std-dev of the soft scores / usage) so the price
+            # coefficient lives on the same scale as `soft_usage`.
+            #
+            # Compute a stable std-dev for usage scaling. Use float32 for stability
+            # and clamp to avoid divide-by-zero or tiny-scaling.
+            with torch.no_grad():
+                # Compute sigma_s as the std-dev across experts of the per-expert
+                # soft usage (Σ_t s_{i,t}). Using the std of `soft_usage` keeps the
+                # conversion and the dual updates in the same unit (usage sums per expert).
+                sigma_s = soft_usage.to(dtype=torch.float32).std().clamp_min(1e-8)
 
-            # Optionally clip lambda used in the loss (decoupled from routing)
-            expert_prices_for_loss = self.expert_prices
+            # Scale stored, dimensionless prices into usage units for the loss.
+            prices_for_loss = (
+                self.expert_prices.to(dtype=torch.float32) * sigma_s
+            ).to(dtype=soft_usage.dtype, device=soft_usage.device)
+
+            # Optionally clamp the price used in the loss (apply clamp in usage units)
             loss_lambda_max = getattr(self.config, 'moe_cp_loss_lambda_max', None)
             if loss_lambda_max is not None:
-                # use clamped copy for loss computation only
-                expert_prices_for_loss = expert_prices_for_loss.clamp(max=float(loss_lambda_max))
+                prices_for_loss = prices_for_loss.clamp(max=float(loss_lambda_max))
 
-            # If scale-robust routing enabled, normalize lambda by sigma_r for the loss term
-            if getattr(self.config, 'moe_cp_scale_robust_routing', False):
-                with torch.no_grad():
-                    sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
-                pricing_loss = torch.sum((expert_prices_for_loss.detach() / sigma_r) * soft_usage)
-            else:
-                pricing_loss = torch.sum(expert_prices_for_loss.detach() * soft_usage)
+            # Detach prices so gradients flow only into the primal (soft_usage path)
+            pricing_loss = torch.sum(prices_for_loss.detach() * soft_usage)
 
             # Attach the loss to the graph so it can be backpropagated
             # We reuse the attach_and_log_load_balancing_loss helper
