@@ -726,19 +726,6 @@ class TransformerConfig(ModelParallelConfig):
     moe_cp_routing_offset: bool = True
     """Apply expert price offset during dispatch (logits - prices)."""
 
-    # EMA smoothing for price (lambda) updates
-    moe_cp_use_ema: bool = False
-    """Whether to use EMA smoothing on observed expert usage before updating prices."""
-
-    moe_cp_ema_beta: float = 0.99
-    """EMA beta for smoothing expert usage. Typical value: 0.99. Only used if moe_cp_use_ema is True."""
-
-    # Scale-robust routing and loss normalization
-    moe_cp_scale_robust_routing: bool = False
-    """If True, normalize routing offsets by the current logit stddev (sigma_r).
-    Routing uses logits - sigma_r * lambda, while the loss term uses lambda / sigma_r.
-    Enable to make lambda dimensionless relative to router logit scale."""
-
     # Optional clipping of lambda when computing the loss contribution (decoupled from routing)
     moe_cp_loss_lambda_max: Optional[float] = None
     """If set, clamp per-expert lambda values to this max when computing the capacity pricing loss.
