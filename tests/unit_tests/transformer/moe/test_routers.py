@@ -628,6 +628,28 @@ class TestCapacityPricedRouter:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_routing_supports_topk_selection(self):
+        self.router = self.router.cuda()
+        self.router.config.moe_router_topk = 2
+        self.router.topk = 2
+        with torch.no_grad():
+            self.router.weight.zero_()
+            if self.router.bias is not None:
+                self.router.bias.zero_()
+            self.router.expert_prices.copy_(
+                torch.tensor([3.0, 0.0, 2.0, 1.0], device=self.router.expert_prices.device)
+            )
+            hidden_states = torch.zeros((4, 2, self.router.config.hidden_size), device="cuda")
+            probs, routing_map = self.router(hidden_states)
+
+        assert routing_map.shape == (8, self.router.config.num_moe_experts)
+        selected_experts = torch.nonzero(routing_map, as_tuple=False)[:, 1]
+        assert torch.equal(torch.unique(selected_experts), torch.tensor([1, 3], device=selected_experts.device))
+        assert torch.allclose(probs.sum(dim=-1), probs.new_ones(probs.shape[0]))
+        assert torch.all(probs[routing_map] > 0)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_price_update_tatonnement(self):
         self.router = self.router.cuda()
         with torch.no_grad():

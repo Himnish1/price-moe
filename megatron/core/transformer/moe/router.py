@@ -439,7 +439,7 @@ class Router(ABC, MegatronModule):
 
 
 class CapacityPricedRouter(Router):
-    """Top-1 capacity-priced router with tatonnement price updates."""
+    """Top-k capacity-priced router with tatonnement price updates."""
 
     def __init__(
         self,
@@ -448,7 +448,7 @@ class CapacityPricedRouter(Router):
         is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
-        self.topk = 1
+        self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
@@ -507,28 +507,24 @@ class CapacityPricedRouter(Router):
             self.expert_prices.data = self.expert_prices.data.to(torch.float32)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
-        """Route with argmax(logits - expert_prices) or argmax(logits) for top-1 dispatch."""
+        """Route with top-k selection over price-adjusted logits."""
         logits = logits.view(-1, self.config.num_moe_experts)
 
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
 
-        if self.config.moe_cp_routing_offset:
-            dispatch_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
-        else:
-            dispatch_logits = logits
-        top1_indices = torch.argmax(dispatch_logits, dim=-1, keepdim=True)
-
-        if self.config.moe_router_score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float()).type_as(logits)
-            top1_scores = torch.gather(scores, dim=1, index=top1_indices)
-        else:
-            # Match TopKRouter: softmax over top-k logits only; for top-1 this sums to 1 per row.
-            selected_logits = torch.gather(logits, dim=1, index=top1_indices)
-            top1_scores = torch.softmax(selected_logits, dim=-1, dtype=torch.float32).type_as(logits)
-
-        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top1_indices, True)
-        probs = torch.zeros_like(logits).scatter(1, top1_indices, top1_scores)
+        probs, routing_map = topk_routing_with_score_function(
+            logits,
+            self.topk,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            score_function=self.score_function,
+            expert_bias=None,
+            fused=self.config.moe_router_fusion,
+            router_replay=None,
+        )
 
         # Keep padded tokens from contributing to dispatch or price updates.
         if padding_mask is not None:
@@ -667,13 +663,15 @@ class CapacityPricedRouter(Router):
 
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
         if self.config.moe_cp_routing_offset:
-            aux_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            dispatch_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            aux_logits = dispatch_logits
         else:
+            dispatch_logits = logits
             aux_logits = logits
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(dispatch_logits, padding_mask=padding_mask)
         probs, routing_map = self._apply_routing_regularization(
-            logits,
+            dispatch_logits,
             probs,
             routing_map,
             padding_mask,
@@ -706,8 +704,7 @@ class CapacityPricedRouter(Router):
             if padding_mask is not None:
                 scores = scores * (~padding_mask).unsqueeze(-1).to(dtype=scores.dtype)
 
-            # Sum of scores per expert: Σ_t s_{i,t}
-            soft_usage = scores.sum(dim=0)
+            soft_usage = (scores * routing_map.to(dtype=scores.dtype)).sum(dim=0)
 
             # Compute Pricing Loss: Σ λ_i · Σ s_{i,t}
             # Note: We detach expert_prices to treat them as constants (dual variables)
