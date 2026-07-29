@@ -1852,8 +1852,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_capacity_priced_routing:
             if self.num_moe_experts is None:
                 raise ValueError("moe_capacity_priced_routing requires num_moe_experts to be set.")
-            if self.moe_router_topk != 1:
-                raise ValueError("moe_capacity_priced_routing currently supports only top-1 routing.")
             if self.moe_cp_price_learning_rate <= 0:
                 raise ValueError("moe_cp_price_learning_rate must be > 0.")
             if not 0.0 <= self.moe_cp_slack_capacity <= 1.0:
