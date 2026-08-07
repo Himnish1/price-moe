@@ -4,8 +4,6 @@ from abc import ABC, abstractmethod
 from typing import Optional, Union
 
 import torch
-import csv
-import os
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -480,20 +478,16 @@ class CapacityPricedRouter(Router):
             'expert_prices',
             torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
         )
-        self.register_buffer(
-            'cp_steps',
-            torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
-            persistent=False,
-        )
-        self.register_buffer(
-            'cached_expert_usage',
-            torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
-            persistent=False,
-        )
         # number of steps accumulated into cached_expert_usage
         self.register_buffer(
             'cp_accum_steps',
             torch.tensor(0, dtype=torch.long, device=torch.cuda.current_device()),
+            persistent=False,
+        )
+        # Accumulated usage counts over the accumulation window (floating sum)
+        self.register_buffer(
+            'cached_expert_usage',
+            torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
             persistent=False,
         )
         self.register_buffer(
@@ -513,8 +507,15 @@ class CapacityPricedRouter(Router):
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
 
+        # Optionally apply scale-robust routing offset: subtract sigma_r * lambda
         if self.config.moe_cp_routing_offset:
-            dispatch_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            # Compute std dev across current batch (tokens x experts) in float32 for stability
+            with torch.no_grad():
+                sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
+            dispatch_logits = logits - (
+                sigma_r.to(dtype=logits.dtype)
+                * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            )
         else:
             dispatch_logits = logits
         top1_indices = torch.argmax(dispatch_logits, dim=-1, keepdim=True)
@@ -561,13 +562,15 @@ class CapacityPricedRouter(Router):
         accum_steps = float(self.cp_accum_steps.item())
         avg_usage = (self.cached_expert_usage / accum_steps).to(device=self.expert_prices.device, dtype=torch.float32)
 
-        # maintain float32 expert prices
-        self._maintain_float32_expert_prices()
+        # Convert usage delta to the canonical dimensionless price update by
+        # dividing by the per-expert usage std (sigma_s_usage). This matches the
+        # scaling used in the pricing loss (which multiplies dimensionless prices
+        # by sigma_s to get usage units).
+        with torch.no_grad():
+            sigma_s_usage = avg_usage.to(dtype=torch.float32).std().clamp_min(1e-8)
 
-        # increment global cp_steps (kept for logging parity)
-        self.cp_steps += 1
-
-        # compute expert capacity and target
+        # tatonnement update on averaged (optionally EMA-smoothed) usage
+        # compute expert capacity and target (same logic as earlier implementation)
         if self.config.moe_cp_expert_capacity is None:
             expert_capacity = avg_usage.sum() / max(self.config.num_moe_experts, 1)
         else:
@@ -578,10 +581,13 @@ class CapacityPricedRouter(Router):
             )
         target_capacity = self.slack_capacity * expert_capacity
 
-        # tatonnement update on averaged usage
-        new_prices = self.expert_prices + self.price_learning_rate * (avg_usage - target_capacity)
-
         with torch.no_grad():
+
+            # scale-robust update: divide by usage-scale to keep stored prices dimensionless
+            new_prices = self.expert_prices + (
+                self.price_learning_rate * ((avg_usage - target_capacity) / sigma_s_usage)
+            )
+
             # clamp non-negative and copy
             self.expert_prices.copy_(new_prices.clamp(min=0.0))
             # reset accumulator
@@ -666,8 +672,14 @@ class CapacityPricedRouter(Router):
             padding_mask = padding_mask.reshape(-1)
 
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+        # Aux logits used for aux losses: apply same routing offset logic as routing
         if self.config.moe_cp_routing_offset:
-            aux_logits = logits - self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            with torch.no_grad():
+                sigma_r = logits.to(dtype=torch.float32).std().clamp_min(1e-8)
+            aux_logits = logits - (
+                sigma_r.to(dtype=logits.dtype)
+                * self.expert_prices.unsqueeze(0).to(dtype=logits.dtype)
+            )
         else:
             aux_logits = logits
 
@@ -709,10 +721,32 @@ class CapacityPricedRouter(Router):
             # Sum of scores per expert: Σ_t s_{i,t}
             soft_usage = scores.sum(dim=0)
 
-            # Compute Pricing Loss: Σ λ_i · Σ s_{i,t}
-            # Note: We detach expert_prices to treat them as constants (dual variables)
-            # for the gradient of the primal objective.
-            pricing_loss = torch.sum(self.expert_prices.detach() * soft_usage)
+            # Pricing loss: convert dimensionless stored expert_prices -> usage units
+            # We store `self.expert_prices` as a dimensionless canonical variable.
+            # For the loss, scale it into the soft-usage units by multiplying by
+            # sigma_s (std-dev of the soft scores / usage) so the price
+            # coefficient lives on the same scale as `soft_usage`.
+            #
+            # Compute a stable std-dev for usage scaling. Use float32 for stability
+            # and clamp to avoid divide-by-zero or tiny-scaling.
+            with torch.no_grad():
+                # Compute sigma_s as the std-dev across experts of the per-expert
+                # soft usage (Σ_t s_{i,t}). Using the std of `soft_usage` keeps the
+                # conversion and the dual updates in the same unit (usage sums per expert).
+                sigma_s = soft_usage.to(dtype=torch.float32).std().clamp_min(1e-8)
+
+            # Scale stored, dimensionless prices into usage units for the loss.
+            prices_for_loss = (
+                self.expert_prices.to(dtype=torch.float32) * sigma_s
+            ).to(dtype=soft_usage.dtype, device=soft_usage.device)
+
+            # Optionally clamp the price used in the loss (apply clamp in usage units)
+            loss_lambda_max = getattr(self.config, 'moe_cp_loss_lambda_max', None)
+            if loss_lambda_max is not None:
+                prices_for_loss = prices_for_loss.clamp(max=float(loss_lambda_max))
+
+            # Detach prices so gradients flow only into the primal (soft_usage path)
+            pricing_loss = torch.sum(prices_for_loss.detach() * soft_usage)
 
             # Attach the loss to the graph so it can be backpropagated
             # We reuse the attach_and_log_load_balancing_loss helper

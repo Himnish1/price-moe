@@ -726,6 +726,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_cp_routing_offset: bool = True
     """Apply expert price offset during dispatch (logits - prices)."""
 
+    # Optional clipping of lambda when computing the loss contribution (decoupled from routing)
+    moe_cp_loss_lambda_max: Optional[float] = None
+    """If set, clamp per-expert lambda values to this max when computing the capacity pricing loss.
+    Routing still uses the unclamped lambda. Set to None to disable clipping."""
+
     moe_cp_log_interval: int = 100
     """Logging interval for CP-MoE price logging when enabled."""
 
